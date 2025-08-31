@@ -1,81 +1,137 @@
 pipeline {
     agent {
         docker {
-            image 'docker:stable'
+            image 'python:3.9-slim'
             args '-v /var/run/docker.sock:/var/run/docker.sock'
         }
     }
+   
     environment {
         AWS_ACCOUNT_ID = '992382545251'
         AWS_REGION = 'us-east-1'
         ECR_REPO = 'rachel-jenkins'
         APP_NAME = 'calculator-app'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        PROD_HOST = '10.0.1.73'
     }
+   
     stages {
-        stage('Login to AWS ECR') {
-            steps {
-                sh '''
-                    aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-                '''
-            }
-        }
-        stage('Build Image') {
+        stage('Setup') {
             steps {
                 script {
-                    IMAGE_TAG = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
-                    IMAGE_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+                    sh '''
+                        apt-get update
+                        apt-get install -y curl docker.io awscli
+                        pip install -r requirements.txt
+                    '''
                 }
-                sh "docker build -t $IMAGE_URI ."
             }
         }
-        stage('Run Tests') {
+       
+        stage('Build Container Image') {
             steps {
-                sh '''
-                    python -m venv .venv
-                    . .venv/bin/activate
-                    pip install -r requirements.txt
-                    python -m unittest discover -s tests -v
-                '''
+                script {
+                    if (env.BRANCH_NAME == 'main') {
+                        env.IMAGE_TAG = "latest-${BUILD_NUMBER}"
+                    } else if (env.CHANGE_ID) {
+                        env.IMAGE_TAG = "pr-${CHANGE_ID}-${BUILD_NUMBER}"
+                    } else {
+                        env.IMAGE_TAG = "${BRANCH_NAME}-${BUILD_NUMBER}"
+                    }
+                    sh """
+                        docker build -t ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG} .
+                    """
+                }
             }
         }
-        stage('Push Image to ECR') {
+       
+        stage('Test') {
             steps {
-                sh "docker push $IMAGE_URI"
+                script {
+                    sh '''
+                        python -m unittest discover -s tests -v
+
+                        mkdir -p test-results
+                        python -m unittest discover -s tests -v > test-results/test-output.txt 2>&1 || true
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'test-results/*.txt', fingerprint: true
+                }
             }
         }
+       
+        stage('Push to ECR') {
+            steps {
+                script {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        docker push ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+                        echo "Pushed image: ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+                    """
+                }
+            }
+        }
+       
         stage('Deploy to Production') {
             when {
                 branch 'main'
             }
             steps {
                 script {
-                    PRODUCTION_HOST = "production-ec2-host"
-                    PRODUCTION_IMAGE_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:latest"
+                    sshagent(['production-ssh-key']) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ec2-user@${PROD_HOST} '
+                                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                                docker pull ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+                                docker stop ${APP_NAME} || true
+                                docker rm ${APP_NAME} || true
+                                docker run -d --name ${APP_NAME} -p 5000:5000 ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}
+                                sleep 10
+                            '
+                        """
+                    }
                 }
-                sh """
-                    ssh -o StrictHostKeyChecking=no ec2-user@${PRODUCTION_HOST} '
-                        docker pull ${PRODUCTION_IMAGE_URI} &&
-                        docker stop ${APP_NAME} || true &&
-                        docker rm ${APP_NAME} || true &&
-                        docker run -d --name ${APP_NAME} -p 5000:5000 ${PRODUCTION_IMAGE_URI}
-                    '
-                """
             }
         }
-        stage('Health Check') {
+       
+        stage('Health Verification') {
             when {
                 branch 'main'
             }
             steps {
                 script {
-                    PRODUCTION_HOST = "production-ec2-host"
-                }
-                retry(5) {
                     sh """
-                        ssh ec2-user@${PRODUCTION_HOST} '
-                            curl -fsS http://localhost:5000/health
-                        '
+                        for i in \$(seq 1 10); do
+                            echo "Health check attempt \$i"
+                            if curl -f http://${PROD_HOST}:5000/health; then
+                                echo "Health check passed!"
+                                exit 0
+                            fi
+                            sleep 5
+                        done
+                        echo "Health check failed after 10 attempts"
+                        exit 1
                     """
+                }
+            }
+        }
+    }
+   
+    post {
+        always {
+            script {
+                echo "Pipeline completed for branch: ${BRANCH_NAME}"
+                echo "Image built: ${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}"
+            }
+        }
+        failure {
+            script {
+                if (env.BRANCH_NAME == 'main') {
+                    echo "Production deployment failed! Rolling back..."
+            
                 }
             }
         }
